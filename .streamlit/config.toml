@@ -1,1 +1,11 @@
+# Save as .streamlit/config.toml in your project root (the folder that contains src/, models/ and videos/)
+[server]
+maxUploadSize = 2048        # largest video you can upload, in MB (Streamlit's default is only 200)
 
+[theme]
+base = "light"
+primaryColor = "#14532D"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F0FAF3"
+textColor = "#14261B"
+font = "sans serif"
