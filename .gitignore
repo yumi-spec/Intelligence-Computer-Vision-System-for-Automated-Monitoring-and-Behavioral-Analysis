@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.idea/
+.env
+logs/*.csv
+settings.json
+# Ignore model files by default
+models/*.pt
+models/*.onnx
+
+# Allow the trained YOLO model needed by the application
+!models/best.pt
