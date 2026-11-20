@@ -39,6 +39,46 @@ logging.getLogger("ultralytics").setLevel(logging.ERROR)  # hide repeated Ultral
 
 st.set_page_config(page_title="Milkfish Monitoring", page_icon="🐟", layout="wide",
                    initial_sidebar_state="expanded")
+
+# Hide Streamlit branding and GitHub links
+st.markdown("""
+<style>
+/* Hide Streamlit menu */
+#MainMenu {
+    visibility: hidden;
+}
+
+/* Hide header and footer */
+header {
+    visibility: hidden;
+}
+
+footer {
+    visibility: hidden;
+}
+
+/* Hide GitHub icon */
+#GithubIcon {
+    display: none !important;
+}
+
+/* Hide Streamlit viewer badge */
+div[class*="viewerBadge"] {
+    display: none !important;
+}
+
+/* Hide toolbar */
+div[data-testid="stToolbar"] {
+    visibility: hidden;
+}
+
+/* Hide Streamlit decoration */
+div[data-testid="stDecoration"] {
+    display: none;
+}
+</style>
+""", unsafe_allow_html=True)
+
 _s0 = st.session_state.get("settings") or Settings.load()
 st.markdown(f"<style>{ui.h(build_css(getattr(_s0, 'theme_mode', 'light')))}</style>", unsafe_allow_html=True)
 
