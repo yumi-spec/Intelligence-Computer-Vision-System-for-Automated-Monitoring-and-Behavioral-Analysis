@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS videos (
     cohesion REAL, status TEXT, ok INTEGER);
 CREATE TABLE IF NOT EXISTS fish (
     id INTEGER PRIMARY KEY AUTOINCREMENT, video_id INTEGER NOT NULL REFERENCES videos(id) ON DELETE CASCADE,
-    fish_id TEXT, behavior TEXT, tone TEXT, pattern TEXT, speed REAL);
+    fish_id TEXT, behavior TEXT, tone TEXT, pattern TEXT, speed REAL, activity TEXT);
 CREATE INDEX IF NOT EXISTS idx_fish_video ON fish(video_id);
 CREATE INDEX IF NOT EXISTS idx_metrics_time ON metrics(timestamp);
 """
@@ -55,6 +55,11 @@ def _init() -> None:
         try:
             con.execute("PRAGMA journal_mode=WAL")
             con.executescript(SCHEMA)
+            try:  # databases created by an earlier version get the new column
+                con.execute("ALTER TABLE fish ADD COLUMN activity TEXT")
+                con.commit()
+            except sqlite3.OperationalError:
+                pass
             if fresh:
                 with con:
                     _import_old_csv(con)
@@ -174,8 +179,9 @@ def add_video(rec: dict) -> int:
             (rec["analyzed_at"], rec["video"], rec["duration"], rec["n"], rec["normal"], rec["schooling"], rec["feeding"],
              rec["unusual"], rec["dominant"], round(rec["avg_speed"], 2), rec["cohesion"], rec["status"],
              int(rec["ok"]))).lastrowid
-        con.executemany("INSERT INTO fish (video_id,fish_id,behavior,tone,pattern,speed) VALUES (?,?,?,?,?,?)",
-                        [(vid, f["id"], f["behavior"], f["tone"], f["pattern"], f["speed"]) for f in rec["fish"]])
+        con.executemany("INSERT INTO fish (video_id,fish_id,behavior,tone,pattern,speed,activity) VALUES (?,?,?,?,?,?,?)",
+                        [(vid, f["id"], f["behavior"], f["tone"], f["pattern"], f["speed"], f.get("activity", ""))
+                         for f in rec["fish"]])
     return vid
 
 
@@ -185,7 +191,7 @@ def load_videos() -> list:
     with _conn() as con:
         for v in con.execute("SELECT * FROM videos ORDER BY id DESC").fetchall():
             fish = [{"id": f["fish_id"], "behavior": f["behavior"], "tone": f["tone"], "pattern": f["pattern"],
-                     "speed": f["speed"]}
+                     "speed": f["speed"], "activity": f["activity"] or "—"}
                     for f in con.execute("SELECT * FROM fish WHERE video_id=? ORDER BY id", (v["id"],)).fetchall()]
             out.append({"analyzed_at": v["analyzed_at"], "video": v["video"], "duration": v["duration"], "n": v["n"],
                         "normal": v["normal"], "schooling": v["schooling"], "feeding": v["feeding"],
