@@ -50,23 +50,21 @@ class Settings:
     realtime: bool = False                    # True = wait so a video plays at its natural speed (slower)
     frame_stride: int = 1                     # analyse every Nth frame (1 = every frame)
 
-    # ---- behavior thresholds (pixel based -> calibrate to YOUR camera) ----
-    active_speed: float = 5.0                 # px/s: below this a fish counts as inactive
-    erratic_speed: float = 150.0              # px/s: sustained speed above this = unusual
-    erratic_turn_rate: float = 1.0            # sharp turns per second considered unusual
-    turn_angle_deg: float = 60.0              # heading change that counts as a "sharp turn"
-    surface_zone: float = 0.0                 # no longer used (kept so old settings.json files still load)
-    surface_secs: float = 5.0                 # no longer used
-    abnormal_fraction: float = 0.30           # share of fish needed to flag the whole school as unusual
-    min_fish_alert: int = 3                   # don't flag the school with fewer fish than this
-    inactive_secs: float = 10.0               # a fish barely moving this long counts as unusual
+    # ---- movement analysis: data quality (these are NOT behavior thresholds) ----
+    move_window_s: float = 5.0                # seconds of movement history used to judge a fish
+    min_track_s: float = 3.0                  # tracking time needed before a fish is judged
+    max_bl_per_s: float = 25.0                # tracking-error guard: faster than this (body lengths/s) = position jump
+    low_move_bl: float = 0.6                  # activity: area covered during the window, in body lengths
 
-    # ---- schooling and feeding rules (distances are fractions of the frame diagonal) ----
-    school_radius: float = 0.12               # fish this close can form a school
+    # ---- behavior classification (movement patterns over time, not swimming-speed values) ----
+    unusual_z: float = 3.0                    # how far from normal movement counts as unusual (statistical deviation)
+    unusual_persist_s: float = 1.5            # the irregular movement must last this long
+    abnormal_fraction: float = 0.30           # share of classified fish needed to flag the whole school as unusual
+    min_fish_alert: int = 3                   # don't flag the school with fewer classified fish than this
+    school_neighbor_bl: float = 6.0           # fish this close (body lengths) can be part of the same school
+    school_coord: float = 0.7                 # direction agreement over time needed between schooling fish (0-1)
     school_min_fish: int = 3                  # fish moving together needed to call it schooling
-    school_align_deg: float = 35.0            # headings within this angle = same direction
-    feeding_radius: float = 0.08              # tighter gathering = feeding
-    feeding_min_fish: int = 4                 # fish needed in the gathering
+    feeding_min_fish: int = 3                 # fish sharing localized repeated movement needed for feeding
     feeding_zone: float = 0.0                 # top fraction of the frame where feeding happens (0 = anywhere)
 
     # ---- appearance ----
