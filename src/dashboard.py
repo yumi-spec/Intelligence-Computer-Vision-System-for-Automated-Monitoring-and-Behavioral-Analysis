@@ -39,46 +39,6 @@ logging.getLogger("ultralytics").setLevel(logging.ERROR)  # hide repeated Ultral
 
 st.set_page_config(page_title="Milkfish Monitoring", page_icon="🐟", layout="wide",
                    initial_sidebar_state="expanded")
-
-# Hide Streamlit branding and GitHub links
-st.markdown("""
-<style>
-/* Hide Streamlit menu */
-#MainMenu {
-    visibility: hidden;
-}
-
-/* Hide header and footer */
-header {
-    visibility: hidden;
-}
-
-footer {
-    visibility: hidden;
-}
-
-/* Hide GitHub icon */
-#GithubIcon {
-    display: none !important;
-}
-
-/* Hide Streamlit viewer badge */
-div[class*="viewerBadge"] {
-    display: none !important;
-}
-
-/* Hide toolbar */
-div[data-testid="stToolbar"] {
-    visibility: hidden;
-}
-
-/* Hide Streamlit decoration */
-div[data-testid="stDecoration"] {
-    display: none;
-}
-</style>
-""", unsafe_allow_html=True)
-
 _s0 = st.session_state.get("settings") or Settings.load()
 st.markdown(f"<style>{ui.h(build_css(getattr(_s0, 'theme_mode', 'light')))}</style>", unsafe_allow_html=True)
 
@@ -196,10 +156,10 @@ def draw(ph: dict, main_only: bool = False) -> None:
 
 
 # ======================================================================== overall results
-MIN_OBS = 50           # a track must be seen in at least this many frames to count as a fish (about 2 s at 25 fps).
-                       # behavior.py needs ~1.5 s of history to judge speed and turns, so shorter tracks are not
-                       # reliable and a brand-new track would otherwise count as "Normal"
-ABNORMAL_SHARE = 0.20  # a fish counts as Erratic / Low Oxygen if it showed that for >= 20% of its time on screen
+MIN_OBS = 50           # a track must be seen in at least this many frames to count as a unique fish (about 2 s at
+                       # 25 fps), so short flickers and broken tracks are not counted as extra fish
+MIN_CLASSIFIED = 10    # a fish needs at least this many classified observations to get an overall behavior
+ABNORMAL_SHARE = 0.20  # a fish counts as Unusual overall if it showed unusual movement for >= 20% of its classified time
 
 
 def series_trend(series: list, min_delta: float, min_len: int = 10) -> str:
@@ -222,7 +182,7 @@ class OverallStats:
     def __init__(self, min_obs: int = MIN_OBS) -> None:
         self.min_obs = min_obs  # frames a track needs to be reliable (lower when frames are skipped)
         self.frames = 0
-        self.eval_frames = 0  # frames after the warm-up (speeds are still 0 during warm-up)
+        self.eval_frames = 0  # frames after the warm-up (nothing can be judged before fish have enough history)
         self.count_sum = 0
         self.peak = 0
         self.speed_sum, self.speed_n = 0.0, 0
@@ -230,7 +190,8 @@ class OverallStats:
         self.alert_frames = 0
         self.speed_series: list = []
         self.coh_series: list = []
-        self.fish: dict = {}  # id -> {"seen", "sp": speed sum, "n": observations, "st": Counter, "ar": Counter}
+        # id -> {"seen", "sp": speed sum, "sn": speed count, "n": classified obs, "st", "ar", "act": Counters}
+        self.fish: dict = {}
 
     def add(self, snap) -> None:
         warming = getattr(snap, "kind", "") == "warming"
@@ -239,7 +200,7 @@ class OverallStats:
         self.peak = max(self.peak, snap.count)
         if not warming:
             self.eval_frames += 1
-            if snap.count:
+            if getattr(snap, "speed_known", 0) > 0:
                 self.speed_sum += snap.avg_speed
                 self.speed_n += 1
                 self.speed_series.append(snap.avg_speed)
@@ -250,32 +211,48 @@ class OverallStats:
             if snap.level != "ok":
                 self.alert_frames += 1
         for f in snap.fish:
-            rec = self.fish.setdefault(f.id, {"seen": 0, "sp": 0.0, "n": 0, "st": Counter(), "ar": Counter()})
+            rec = self.fish.setdefault(f.id, {"seen": 0, "sp": 0.0, "sn": 0, "n": 0, "st": Counter(),
+                                              "ar": Counter(), "act": Counter()})
             rec["seen"] += 1
-            if not warming:
+            rec["act"][getattr(f, "activity", "unknown")] += 1
+            if getattr(f, "speed_ok", False):
                 rec["sp"] += f.speed
+                rec["sn"] += 1
+            if f.status != "Insufficient":  # not enough tracking data: never counted as a behavior
                 rec["n"] += 1
                 rec["st"][f.status] += 1
                 rec["ar"][getattr(f, "arrow", "—")] += 1
 
+    def reliable(self) -> int:
+        """Unique fish: tracks seen long enough (short flickers and broken tracks are not counted)."""
+        return sum(1 for r in self.fish.values() if r["seen"] >= self.min_obs)
+
     def usable(self) -> int:
-        """Fish with enough observations to judge (same rule as the end-of-video report)."""
         return sum(1 for r in self.fish.values() if r["seen"] >= self.min_obs and r["n"] > 0)
 
     def extra(self) -> dict:
-        return {"coh_trend": series_trend(self.coh_series, 5.0), "peak": self.peak, "usable": self.usable()}
+        return {"coh_trend": series_trend(self.coh_series, 5.0), "peak": self.peak, "usable": self.usable(),
+                "unique": self.reliable()}
 
 
 def _fish_class(rec: dict) -> str:
-    """Behavior that best describes a fish over the whole video. Unusual wins when it was shown for a meaningful
-    share of the fish's time on screen; otherwise the most common of Normal / Schooling / Feeding."""
+    """Behavior that best describes a fish over the whole video, from its classified observations only.
+    Unusual wins when it was shown for a meaningful share of that time; otherwise the most common of
+    Normal / Schooling / Feeding. Too little classified time gives "Insufficient", never a guessed behavior."""
     n = rec["n"]
-    if n == 0:
-        return "Normal"
+    if n < MIN_CLASSIFIED:
+        return "Insufficient"
     if rec["st"].get("Unusual", 0) / n >= ABNORMAL_SHARE:
         return "Unusual"
-    best = max(("Normal", "Schooling", "Feeding"), key=lambda k: (rec["st"].get(k, 0), k == "Normal"))
-    return best
+    return max(("Normal", "Schooling", "Feeding"), key=lambda k: (rec["st"].get(k, 0), k == "Normal"))
+
+
+def _fish_activity(rec: dict) -> str:
+    """Active / low movement over the whole video, kept separate from behavior."""
+    a, low = rec["act"].get("active", 0), rec["act"].get("low", 0)
+    if a + low < MIN_CLASSIFIED:
+        return "unknown"
+    return "active" if a >= low else "low"
 
 
 def _fish_arrow(rec: dict) -> str:
@@ -288,17 +265,19 @@ def overall_snapshot(st_: OverallStats, s: Settings, events: list | None = None)
     fish = {i: r for i, r in st_.fish.items() if r["seen"] >= st_.min_obs} or st_.fish
     total = len(fish)
     dom = {i: _fish_class(r) for i, r in fish.items()}
-    mean_sp = {i: (r["sp"] / r["n"] if r["n"] else 0.0) for i, r in fish.items()}
-    normal = sum(1 for v in dom.values() if v == "Normal")
-    schooling = sum(1 for v in dom.values() if v == "Schooling")
-    feeding = sum(1 for v in dom.values() if v == "Feeding")
-    unusual = sum(1 for v in dom.values() if v == "Unusual")
-    active_thr = getattr(s, "active_speed", 5.0)
-    active = sum(1 for v in mean_sp.values() if v > active_thr)
-    avg_speed = st_.speed_sum / st_.speed_n if st_.speed_n else 0.0
+    act = {i: _fish_activity(r) for i, r in fish.items()}
+    mean_sp = {i: (r["sp"] / r["sn"] if r["sn"] else None) for i, r in fish.items()}
+    count = lambda label: sum(1 for v in dom.values() if v == label)  # noqa: E731
+    normal, schooling, feeding = count("Normal"), count("Schooling"), count("Feeding")
+    unusual, insufficient = count("Unusual"), count("Insufficient")
+    classified = total - insufficient
+    active = sum(1 for v in act.values() if v == "active")
+    low = sum(1 for v in act.values() if v == "low")
+    speeds = [v for v in mean_sp.values() if v is not None]
+    avg_speed = sum(speeds) / len(speeds) if speeds else 0.0
     cohesion = st_.coh_sum / st_.coh_n if st_.coh_n else None
     alert_pct = 100.0 * st_.alert_frames / st_.eval_frames if st_.eval_frames else 0.0
-    frac_unusual = unusual / total if total else 0.0
+    frac_unusual = unusual / classified if classified else 0.0
     thr = getattr(s, "abnormal_fraction", 0.3)
     min_fish = getattr(s, "min_fish_alert", 1)
 
@@ -318,28 +297,35 @@ def overall_snapshot(st_: OverallStats, s: Settings, events: list | None = None)
         kind, level, status = "no_fish", "warning", "No Fish Tracked"
         desc = "No milkfish were tracked in this video."
         action, detail = "Review the Video", "Check the video quality and the detection settings."
-    elif frac_unusual >= thr or unusual >= min_fish or alert_pct >= 30:
+    elif classified == 0:
+        kind, level, status = "insufficient", "ok", "Not Enough Tracking Data"
+        desc = (f"{total} milkfish were tracked, but none for long enough to classify their behavior. "
+                "Use a video where the fish stay in view longer.")
+        action, detail = "Review the Video", "Behavior can only be judged after several seconds of tracking per fish."
+    elif (classified >= min_fish and frac_unusual >= thr) or unusual >= min_fish or alert_pct >= 30:
         kind, level, status = "unusual", "warning", "Unusual Swimming Activity Observed"
-        desc = (f"{unusual} of {total} fish ({frac_unusual:.0%}) showed unusual swimming. Unusual activity was "
-                f"present in {alert_pct:.0f}% of the video. This is a video-based observation, not a diagnosis.")
+        desc = (f"{unusual} of {classified} classified fish ({frac_unusual:.0%}) showed irregular movement. Unusual "
+                f"activity was present in {alert_pct:.0f}% of the video. This is a video-based observation, "
+                "not a diagnosis.")
         action, detail = "Inspect the Pond", "Inspect the fingerlings and pond conditions; keep monitoring closely."
     else:
         kind, level, status = "normal", "ok", "Normal Movement Overall"
-        desc = (f"Milkfish swam steadily throughout the video. Normal swimming: {normal}, schooling: {schooling}, "
-                f"feeding: {feeding}.")
+        desc = (f"Milkfish moved consistently throughout the video. Normal swimming: {normal}, schooling: "
+                f"{schooling}, feeding: {feeding}.")
         action, detail = "Continue Routine Monitoring", "No immediate action required."
 
     events = list(events or [])
     if events:
         desc += f" {len(events)} alert event(s) were raised during the video."
-    rows = [SimpleNamespace(id=i, speed=mean_sp[i], arrow=_fish_arrow(fish[i]), status=dom[i],
-                            active=mean_sp[i] > active_thr,
-                            track="Tracked" if fish[i]["seen"] >= st_.min_obs else "Short track")
+    rows = [SimpleNamespace(id=i, speed=mean_sp[i] or 0.0, speed_ok=mean_sp[i] is not None,
+                            arrow=_fish_arrow(fish[i]), status=dom[i], activity=act[i], active=act[i] == "active",
+                            note="", track="Tracked" if fish[i]["seen"] >= st_.min_obs else "Short track")
             for i in sorted(fish)]
     return SimpleNamespace(
-        kind=kind, count=total, avg_speed=avg_speed, cohesion=cohesion, normal=normal, schooling=schooling,
-        feeding=feeding, unusual=unusual, erratic=unusual, low_oxygen=0, active=active, inactive=total - active, status=status, level=level,
-        description=desc, action=action, action_detail=detail, fish=rows, events=events,
+        kind=kind, count=total, avg_speed=avg_speed, speed_known=len(speeds), cohesion=cohesion, normal=normal,
+        schooling=schooling, feeding=feeding, unusual=unusual, insufficient=insufficient, erratic=unusual,
+        low_oxygen=0, active=active, inactive=low, activity_unknown=total - active - low, status=status,
+        level=level, description=desc, action=action, action_detail=detail, fish=rows, events=events,
         details={"Speed Trend": trend, "Peak Count": str(st_.peak)})
 
 
@@ -780,20 +766,30 @@ def page_settings() -> None:
             bind(st.slider, "CLAHE tile size", "clahe_tile", min_value=2, max_value=16, step=1)
         with st.expander("Tracking (DeepSORT)"):
             bind(st.slider, "Frames a lost fish is remembered", "max_age", min_value=5, max_value=120, step=5)
-        with st.expander("Behavior rules (pixel based: calibrate to your camera)"):
-            bind(st.number_input, "Inactive below (px/s)", "active_speed", min_value=0.0, step=1.0)
-            bind(st.number_input, "Unusual above (px/s)", "erratic_speed", min_value=0.0, step=10.0)
-            bind(st.number_input, "Unusual sharp turns per second", "erratic_turn_rate", min_value=0.0, step=0.1)
-            bind(st.number_input, "Sharp turn angle (degrees)", "turn_angle_deg", min_value=10.0, step=5.0)
-            bind(st.number_input, "Inactive for unusual (seconds)", "inactive_secs", min_value=1.0, step=1.0)
-            bind(st.slider, "Share of fish to flag the school", "abnormal_fraction", min_value=0.05, max_value=1.0, step=0.05)
-            bind(st.number_input, "Minimum fish to flag the school", "min_fish_alert", min_value=1, step=1)
-            bind(st.slider, "Schooling distance (fraction of frame)", "school_radius", min_value=0.02, max_value=0.4, step=0.01)
+        with st.expander("Movement analysis (data quality, not behavior thresholds)"):
+            bind(st.slider, "Movement window (seconds)", "move_window_s", min_value=3.0, max_value=10.0, step=0.5)
+            bind(st.slider, "Tracking time needed before judging a fish (seconds)", "min_track_s",
+                 min_value=2.0, max_value=8.0, step=0.5)
+            bind(st.slider, "Tracking-error guard: fastest plausible movement (body lengths per second)",
+                 "max_bl_per_s", min_value=10.0, max_value=60.0, step=1.0)
+            bind(st.slider, "Low movement: area covered in the window (body lengths)", "low_move_bl",
+                 min_value=0.2, max_value=2.0, step=0.1)
+        with st.expander("Behavior classification (movement patterns over time)"):
+            bind(st.slider, "Unusual: how far from normal movement (statistical deviation)", "unusual_z",
+                 min_value=2.0, max_value=5.0, step=0.5)
+            bind(st.slider, "Unusual: the irregular movement must last (seconds)", "unusual_persist_s",
+                 min_value=0.5, max_value=5.0, step=0.5)
+            bind(st.slider, "Share of classified fish to flag the school", "abnormal_fraction",
+                 min_value=0.05, max_value=1.0, step=0.05)
+            bind(st.number_input, "Minimum classified fish to flag the school", "min_fish_alert", min_value=1, step=1)
+            bind(st.slider, "Schooling: neighbour distance (body lengths)", "school_neighbor_bl",
+                 min_value=2.0, max_value=15.0, step=0.5)
+            bind(st.slider, "Schooling: direction agreement over time (0 to 1)", "school_coord",
+                 min_value=0.3, max_value=0.95, step=0.05)
             bind(st.number_input, "Fish needed for schooling", "school_min_fish", min_value=2, step=1)
-            bind(st.slider, "Same-direction angle (degrees)", "school_align_deg", min_value=10.0, max_value=90.0, step=5.0)
-            bind(st.slider, "Feeding gathering distance (fraction of frame)", "feeding_radius", min_value=0.02, max_value=0.3, step=0.01)
             bind(st.number_input, "Fish needed for feeding", "feeding_min_fish", min_value=2, step=1)
-            bind(st.slider, "Feeding zone: top fraction of frame (0 = anywhere)", "feeding_zone", min_value=0.0, max_value=1.0, step=0.05)
+            bind(st.slider, "Feeding zone: top fraction of frame (0 = anywhere)", "feeding_zone",
+                 min_value=0.0, max_value=1.0, step=0.05)
         with st.expander("Alerts"):
             bind(st.number_input, "Seconds unusual activity must last before an alert", "alert_confirm_s", min_value=1, step=1)
             bind(st.number_input, "Seconds between repeated alerts", "alert_cooldown_s", min_value=10, step=10)
