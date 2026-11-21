@@ -28,8 +28,16 @@ def load() -> list:
     return db.load_videos()
 
 
+def _classified(rec: dict) -> int:
+    return sum(rec[k] for k in ("normal", "schooling", "feeding", "unusual"))
+
+
 def _pct(rec: dict, key: str) -> str:
-    return f"{rec[key]} ({round(100 * rec[key] / rec['n']) if rec['n'] else 0}%)"
+    return bui.np_text(rec[key], _classified(rec))
+
+
+def _sp(r: dict, unit: bool = True) -> str:
+    return "—" if r.get("speed") is None else f"{r['speed']:.1f}" + (" px/s" if unit else "")
 
 
 def report_csv(rec: dict) -> str:
@@ -37,12 +45,13 @@ def report_csv(rec: dict) -> str:
             ("Video", "Duration (s)", rec["duration"] or "—"),
             ("Results", "Milkfish tracked", rec["n"])]
     rows += [("Results", f"{title} (fish)", _pct(rec, k)) for k, title, *_ in bui.CATS]
-    rows += [("Results", "Dominant behavior", rec["dominant"]),
+    rows += [("Results", "Not classified yet (tracked too briefly)", max(rec["n"] - _classified(rec), 0)),
+             ("Results", "Dominant behavior", rec["dominant"]),
              ("Results", "Average swimming speed (px/s)", f"{rec['avg_speed']:.1f}"),
              ("Results", "Group movement", bui.group_text(rec.get("cohesion"))),
              ("Results", "Overall monitoring status", "Normal" if rec["ok"] else "Unusual activity observed")]
     rows += [("Summary", "Report", s) for s in bui.sentences(rec)]
-    rows += [("Tracked fish", f"Fish {r['id']}", f"{r['behavior']} | {r['pattern']} | {r['speed']:.1f} px/s")
+    rows += [("Tracked fish", f"Fish {r['id']}", f"{r['behavior']} | {r.get('activity', '—')} | {r['pattern']} | {_sp(r)}")
              for r in rec["fish"]]
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -76,11 +85,11 @@ def report_pdf(rec: dict):
              Spacer(1, 6 * mm), Paragraph("Monitoring Results", st["Heading2"])]
     story += [Paragraph(s, st["Normal"]) for s in bui.sentences(rec)]
     story += [Spacer(1, 5 * mm), Paragraph("Behavior statistics", st["Heading2"]),
-              table([["Behavior", "Fish", "Share"]] + [[title, rec[k], f"{round(100 * rec[k] / rec['n']) if rec['n'] else 0}%"]
+              table([["Behavior", "Fish", "Share"]] + [[title, rec[k], f"{round(100 * rec[k] / _classified(rec)) if _classified(rec) else 0}%"]
                                                       for k, title, *_ in bui.CATS], [90 * mm, 30 * mm, 30 * mm]),
               Spacer(1, 5 * mm), Paragraph("Tracked fish", st["Heading2"])]
     fish = [["Fish ID", "Behavior", "Swimming pattern", "Speed (px/s)"]] + [
-        [r["id"], r["behavior"], Paragraph(r["pattern"], st["BodyText"]), f"{r['speed']:.1f}"] for r in rec["fish"]]
+        [r["id"], r["behavior"], Paragraph(r["pattern"], st["BodyText"]), _sp(r, False)] for r in rec["fish"]]
     story += [table(fish, [20 * mm, 35 * mm, 85 * mm, 30 * mm]), Spacer(1, 5 * mm),
               Paragraph("Unusual swimming is an observation from video. It is not a confirmed disease diagnosis.",
                         st["Italic"])]
