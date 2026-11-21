@@ -22,16 +22,21 @@ CATS = [
     ("unusual", "Unusual Swimming Activity", "Sudden or irregular movement", "warn", "warn"),
 ]
 STATUS_MAP = {  # fish status -> (label, badge tone)
+    "insufficient": ("Not enough data", "mut"),
     "normal": ("Normal Swimming", "ok"), "normal swimming": ("Normal Swimming", "ok"),
     "schooling": ("Schooling", "ok"), "schooling behavior": ("Schooling", "ok"),
     "feeding": ("Feeding", "ok"), "feeding activity": ("Feeding", "ok"),
     "unusual": ("Unusual", "warn"), "erratic": ("Unusual", "warn"), "low oxygen": ("Unusual", "warn"),
 }
-PATTERNS = {"Normal": "Steady swimming", "Schooling": "Swims with the group",
-            "Feeding": "Gathers and moves actively", "Unusual": "Irregular movement"}
+PATTERNS = {"Normal": "Consistent swimming", "Schooling": "Moves in coordination with nearby fish",
+            "Feeding": "Repeated localized group movement", "Unusual": "Irregular movement",
+            "Insufficient": "Tracked too briefly to judge"}
+ACTIVITY = {"active": "Active", "low": "Low movement", "unknown": "Not enough data"}
 DIR_WORDS = {"→": "right", "↗": "up-right", "↑": "up", "↖": "up-left",
              "←": "left", "↙": "down-left", "↓": "down", "↘": "down-right"}
 NOTE = "Unusual swimming is an observation from video. It is not a confirmed disease diagnosis."
+FEED_NOTE = ("Feeding Activity is inferred only from repeated, localized group movement. "
+             "Movement alone cannot confirm that fish are feeding.")
 
 
 # ------------------------------------------------------------------ small helpers
@@ -48,6 +53,15 @@ def counts(snap) -> dict:
         unusual = getattr(snap, "erratic", 0) + getattr(snap, "low_oxygen", 0)
     return {"normal": getattr(snap, "normal", 0), "schooling": getattr(snap, "schooling", 0),
             "feeding": getattr(snap, "feeding", 0), "unusual": unusual}
+
+
+def classified(c: dict) -> int:
+    return sum(c.values())
+
+
+def np_text(n: int, total: int) -> str:
+    """'28 (58%)' - the count first, then its share in brackets."""
+    return f"{n} ({round(100 * n / total) if total else 0}%)"
 
 
 def display_id(idmap: dict, raw) -> str:
@@ -88,35 +102,53 @@ def group_text(cohesion) -> str:
 def facts(snap) -> dict:
     """The key results of one analysed video as plain values (also what is saved in the history)."""
     c = counts(snap)
-    return {"n": int(getattr(snap, "count", sum(c.values()))), **c, "dominant": dominant(c),
-            "avg_speed": float(getattr(snap, "avg_speed", 0.0)), "cohesion": getattr(snap, "cohesion", None),
-            "status": str(getattr(snap, "status", "")), "ok": getattr(snap, "level", "ok") == "ok"}
+    out = {"n": int(getattr(snap, "count", sum(c.values()))), **c, "dominant": dominant(c),
+           "avg_speed": float(getattr(snap, "avg_speed", 0.0)), "cohesion": getattr(snap, "cohesion", None),
+           "status": str(getattr(snap, "status", "")), "ok": getattr(snap, "level", "ok") == "ok"}
+    for k in ("active", "inactive", "activity_unknown"):
+        if hasattr(snap, k):
+            out[k] = int(getattr(snap, k))
+    return out
 
 
 def sentences(f: dict) -> list:
     """The written monitoring result, in plain words."""
-    out = [f"A total of {f['n']} milkfish were tracked in the video."]
-    if f["n"]:
+    n = f["n"]
+    cl = sum(f[k] for k in ("normal", "schooling", "feeding", "unusual"))
+    out = [f"A total of {n} milkfish were tracked in the video."]
+    if cl:
         out.append(f"The dominant observed behavior was {f['dominant']}.")
-    out.append(f"The average swimming speed was {f['avg_speed']:.1f} pixels per second.")
+        if n > cl:
+            out.append(f"{n - cl} fish {'was' if n - cl == 1 else 'were'} tracked too briefly to classify.")
+    elif n:
+        out.append("Behavior could not be classified because the fish were not tracked long enough.")
+    if f.get("active", 0) + f.get("inactive", 0):
+        out.append(f"{f['active']} fish were active and {f['inactive']} showed low movement.")
+    if f["avg_speed"] > 0:
+        out.append(f"The average swimming speed was {f['avg_speed']:.1f} pixels per second.")
     coh = f.get("cohesion")
     if coh is not None:
         out.append("The fish displayed relatively consistent group movement during the observation." if coh >= 60
                    else "The group movement of the fish was loosening during the observation." if coh >= 30
                    else "The fish were widely dispersed, with little group movement.")
-    if f["unusual"] == 0:
-        out.append("No unusual swimming activity was detected during this analysis.")
-    else:
-        out.append(f"Unusual swimming activity was observed in {f['unusual']} of {f['n']} fish. This is a "
-                   "video-based observation, not a disease diagnosis. Inspect the fingerlings and pond conditions.")
-    out.append("Overall monitoring status: " + ("Normal." if f["ok"] else "Unusual activity observed."))
+    if cl:
+        if f["unusual"] == 0:
+            out.append("No unusual swimming activity was detected during this analysis.")
+        else:
+            out.append(f"Unusual swimming activity was observed in {f['unusual']} of {cl} classified fish. This is a "
+                       "video-based observation, not a disease diagnosis. Inspect the fingerlings and pond conditions.")
+    if f["feeding"] > 0:
+        out.append(FEED_NOTE)
+    out.append("Overall monitoring status: " + ("Not enough tracking data to assess." if (n and not cl)
+                                                else "Normal." if f["ok"] else "Unusual activity observed."))
     return out
 
 
-def pattern(status, arrow="—", glyph: bool = False) -> str:
+def pattern(status, arrow="—", glyph: bool = False, note: str = "") -> str:
     label, _ = STATUS_MAP.get(str(status).lower(), ("Normal Swimming", "ok"))
-    text = PATTERNS[label.split()[0]]
-    if arrow in DIR_WORDS:
+    key = "Insufficient" if label.startswith("Not") else label.split()[0]
+    text = (note[:1].upper() + note[1:]) if (key == "Unusual" and note) else PATTERNS[key]
+    if key in ("Normal", "Schooling") and arrow in DIR_WORDS:
         text += f", mostly {DIR_WORDS[arrow]}"
         if glyph:
             text = f"{arrow} {text}"
@@ -129,34 +161,42 @@ def fish_rows(snap, idmap: dict, glyph: bool = True) -> list:
     rows = []
     for f in fish:
         label, tone = STATUS_MAP.get(str(getattr(f, "status", "")).lower(), ("Normal Swimming", "ok"))
+        known = getattr(f, "speed_ok", True)
         rows.append({"id": display_id(idmap, getattr(f, "id", None)), "behavior": label, "tone": tone,
-                     "pattern": pattern(getattr(f, "status", ""), getattr(f, "arrow", "—"), glyph),
-                     "speed": float(getattr(f, "speed", 0.0))})
+                     "activity": ACTIVITY.get(getattr(f, "activity", "unknown"), "—"),
+                     "pattern": pattern(getattr(f, "status", ""), getattr(f, "arrow", "—"), glyph,
+                                        getattr(f, "note", "")),
+                     "speed": float(getattr(f, "speed", 0.0)) if known else None})
     return rows
 
 
 # ------------------------------------------------------------------ cards
 def category_panel(snap, ended: bool = False) -> str:
     c = counts(snap)
-    total = sum(c.values())
+    cl = classified(c)
+    n = max(int(getattr(snap, "count", cl)), cl)
     rows = "".join(
         f'<div class="mf-cat">{_ico(ic, k == "unusual")}<div style="min-width:0"><div class="mf-ct">{t}</div>'
         f'<div class="mf-cd">{d}</div></div><div class="mf-cn"{" style=color:var(--warn)" if k == "unusual" else ""}>'
-        f'{c[k]}<small>{_pct(c[k], total)}%</small></div></div>'
+        f'{c[k]} <small style="display:inline;font-size:12px;font-weight:500;color:var(--mut)">'
+        f'({_pct(c[k], cl)}%)</small></div></div>'
         for k, t, d, ic, _ in CATS)
     tag = "Whole video" if ended else "Current frame"
+    note = f"Shares are of the {cl} fish that could be classified."
+    if n > cl:
+        note += f" {n - cl} more fish need more tracking time."
     return (f'<div class="mf-card"><div class="mf-cardhead"><span class="mf-ch">Behavior categories</span>'
             f'<span class="mf-badge mut">{tag}</span></div><div class="mf-cats">{rows}</div>'
-            f'<div class="mf-note">Counts show fish per category. {NOTE}</div></div>')
+            f'<div class="mf-note">{note} {NOTE}</div></div>')
 
 
 def recommendation(snap) -> str:
     c = counts(snap)
-    total = sum(c.values())
+    total = classified(c)
     if total == 0:
         return ('<div class="mf-card"><div class="mf-cardhead"><span class="mf-ch">Recommendation</span>'
-                '<span class="mf-badge mut">Waiting</span></div><div class="mf-act">No fish tracked yet</div>'
-                '<div class="mf-note">Results appear once milkfish are detected.</div></div>')
+                '<span class="mf-badge mut">Waiting</span></div><div class="mf-act">Collecting movement data</div>'
+                '<div class="mf-note">Each fish needs a few seconds of tracking before its behavior is judged.</div></div>')
     if c["unusual"] > 0:
         return ('<div class="mf-card"><div class="mf-cardhead"><span class="mf-ch">Recommendation</span>'
                 '<span class="mf-badge warn">Check pond</span></div>'
@@ -167,36 +207,48 @@ def recommendation(snap) -> str:
             '<div class="mf-note">No unusual swimming activity was observed.</div></div>')
 
 
-def distribution_card(c: dict, info: str = "") -> str:
-    total = sum(c.values())
+def distribution_card(c: dict, info: str = "", missing: int = 0) -> str:
+    cl = classified(c)
     bars = "".join(
-        f'<div><div class="mf-brow"><span>{t}</span><span>{c[k]} fish · {_pct(c[k], total)}%</span></div>'
-        f'<div class="mf-bar"><i class="{tone}" style="width:{_pct(c[k], total)}%"></i></div></div>'
+        f'<div><div class="mf-brow"><span>{t}</span><span>{np_text(c[k], cl)}</span></div>'
+        f'<div class="mf-bar"><i class="{tone}" style="width:{_pct(c[k], cl)}%"></i></div></div>'
         for k, t, _, _, tone in CATS)
-    note = f'<div class="mf-note">{info}</div>' if info else ""
+    extra = f" · {missing} fish not classified yet (tracked too briefly)" if missing else ""
+    note = f'<div class="mf-note">{info}{extra}</div>' if (info or extra) else ""
     return (f'<div class="mf-card"><div class="mf-cardhead"><span class="mf-ch">Behavior distribution</span></div>'
             f'<div class="mf-bars">{bars}</div>{note}</div>')
 
 
 def fish_table(rows: list) -> str:
+    def speed(r):
+        return "—" if r.get("speed") is None else f'{r["speed"]:.0f}'
     body = "".join(
         f'<tr><td>Milkfish {r["id"]}</td><td><span class="mf-badge {r["tone"]}">{r["behavior"]}</span></td>'
-        f'<td>{r["pattern"]}</td><td class="num">{r["speed"]:.0f}</td></tr>' for r in rows[:60])
+        f'<td>{r.get("activity", "—")}</td><td>{r["pattern"]}</td><td class="num">{speed(r)}</td></tr>'
+        for r in rows[:60])
     if not body:
-        body = '<tr><td colspan="4" class="m">No fish tracked yet</td></tr>'
-    return ('<div class="mf-card"><div class="mf-cardhead"><span class="mf-ch">Tracked fish</span>'
+        body = '<tr><td colspan="5" class="m">No fish tracked yet</td></tr>'
+    return ('<div class="mf-card"><div class="mf-cardhead"><span class="mf-ch">Individual fish tracking details</span>'
             f'<span class="mf-badge mut">{len(rows)} fish</span></div><div class="mf-tw"><table class="mf-tbl">'
-            '<thead><tr><th>Fish ID</th><th>Behavior</th><th>Swimming pattern</th><th class="num">Speed (px/s)</th></tr></thead>'
+            '<thead><tr><th>Fish ID</th><th>Behavior</th><th>Activity</th><th>Movement pattern</th>'
+            '<th class="num">Speed (px/s)</th></tr></thead>'
             f'<tbody>{body}</tbody></table></div></div>')
 
 
 def overall_card(f: dict, tag: str = "Video complete") -> str:
-    status = ('<span class="mf-badge ok">Normal</span>' if f["ok"]
-              else '<span class="mf-badge warn">Unusual activity observed</span>')
-    kv = "".join(f'<div class="mf-kv"><span>{k}</span><b>{v}</b></div>' for k, v in [
-        ("Milkfish tracked", f["n"]), ("Dominant behavior", f["dominant"]),
-        ("Average swimming speed", f'{f["avg_speed"]:.1f} px/s'), ("Group movement", group_text(f.get("cohesion"))),
-        ("Overall monitoring status", status)])
+    cl = sum(f[k] for k in ("normal", "schooling", "feeding", "unusual"))
+    if f["n"] and not cl:
+        status = '<span class="mf-badge mut">Not enough data</span>'
+    elif f["ok"]:
+        status = '<span class="mf-badge ok">Normal</span>'
+    else:
+        status = '<span class="mf-badge warn">Unusual activity observed</span>'
+    rows = [("Milkfish tracked", f["n"]), ("Dominant behavior", f["dominant"])]
+    if "active" in f:
+        rows.append(("Active / low-movement fish", f'{f["active"]} / {f["inactive"]}'))
+    rows += [("Average swimming speed", f'{f["avg_speed"]:.1f} px/s' if f["avg_speed"] > 0 else "—"),
+             ("Group movement", group_text(f.get("cohesion"))), ("Overall monitoring status", status)]
+    kv = "".join(f'<div class="mf-kv"><span>{k}</span><b>{v}</b></div>' for k, v in rows)
     text = " ".join(sentences(f))
     return ('<div class="mf-card"><div class="mf-cardhead"><span class="mf-ch">Overall results</span>'
             f'<span class="mf-badge mut">{tag}</span></div>{kv}<div class="mf-note">{text}</div></div>')
@@ -209,14 +261,15 @@ def lower(snap, ended: bool = False, idmap: dict | None = None) -> str:
     info += f" · Schooling cohesion {coh:.0f}%" if coh is not None else ""
     top = overall_card(facts(snap)) if ended else ""
     return ('<div class="mf" style="display:flex;flex-direction:column;gap:16px">' + top +
-            f'<div class="mf-bottom">{distribution_card(counts(snap), info)}{fish_table(fish_rows(snap, idmap))}</div></div>')
+            f'<div class="mf-bottom">{distribution_card(counts(snap), info, max(int(getattr(snap, "count", 0)) - classified(counts(snap)), 0))}'
+            f'{fish_table(fish_rows(snap, idmap))}</div></div>')
 
 
 def record_view(rec: dict) -> str:
     """The same results panels, built from a saved history record."""
     c = {k: rec[k] for k in ("normal", "schooling", "feeding", "unusual")}
     return ('<div class="mf" style="display:flex;flex-direction:column;gap:16px">' + overall_card(rec, rec.get("analyzed_at", "")) +
-            f'<div class="mf-bottom">{distribution_card(c)}{fish_table(rec.get("fish", []))}</div></div>')
+            f'<div class="mf-bottom">{distribution_card(c, "", max(rec["n"] - classified(c), 0))}{fish_table(rec.get("fish", []))}</div></div>')
 
 
 def progress_bar(done: float, elapsed: float, eta, finished: bool = False) -> str:
