@@ -1,138 +1,260 @@
-"""Alert logic (debounce + cooldown) and optional SMS delivery.
 
-SMS is off unless you enable it in Settings AND configure a provider in .env.
-Supported providers: Twilio and Semaphore (Philippines). Add another by writing
-one more branch in SmsSender.send().
+"""Mga tekstong Tagalog para sa mga alerto, nakuhang larawan, at panel ng rekomendasyon.
+
+Bawat alerto ay may pamagat at tatlong bahagi:
+"Nakita" (obserbasyon), "Posibleng Sanhi" (posibleng dahilan),
+at "Dapat Gawin" (inirerekomendang aksyon).
+
+Ang posibleng sanhi ay pagtataya lamang batay sa galaw ng isda sa video.
+Hindi ito kumpirmadong diagnosis.
 """
+
 from __future__ import annotations
 
-import os
-import threading
-import time
-from collections import deque
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Deque, Dict, List, Optional
+OBS, DIAG, ACT = "Nakita", "Posibleng Sanhi", "Dapat Gawin"
 
-from src import db
-from src.config import ROOT
+DISCLAIMER = "Pagtataya lamang ito batay sa galaw ng isda sa video. Hindi pa ito kumpirmado."
 
-try:  # optional
-    from dotenv import load_dotenv
+LEVEL_TEXT = {
+    "critical": "Suriin agad",
+    "warning": "Bantayan",
+    "ok": "Maayos"
+}
 
-    load_dotenv(ROOT / ".env")
-except ImportError:
-    pass
-
-ABNORMAL = {"unusual", "no_fish"}
-LEVEL_RANK = {"warning": 1, "critical": 2}
-
-# Cautious wording used in the alert log and SMS: unusual swimming seen in video is an observation,
-# not a diagnosis. "erratic" and "low_oxygen" are kept only so older log rows still get a label.
 KIND_LABEL = {
-    "unusual": "Unusual Swimming Activity",
-    "no_fish": "No Fish Detected",
-    "erratic": "Erratic Movement",
-    "low_oxygen": "Low-Oxygen",
+    "fish_unusual": "Hindi normal na paglangoy",
+    "fish_motionless": "Hindi gumagalaw",
+    "school_left": "Nahiwalay sa grupo",
+    "school_turn": "Biglaang pagliko ng grupo",
+    "disturbance": "Biglaang pagbabago ng galaw",
+    "unusual": "Maraming isda ang hindi normal ang paglangoy",
+    "no_fish": "Walang nakitang isda",
+    "erratic": "Hindi normal na paggalaw",
+    "low_oxygen": "Posibleng mababang oxygen",
 }
-KIND_ACTION = {
-    "unusual": "Inspect the fingerlings and pond conditions",
+
+LEVELS = {"fish_motionless": "critical"}
+
+_CHECK_WATER = "Suriin ang kalidad ng tubig (oxygen, temperatura, pH, at ammonia)"
+
+
+def _unusual(c: dict) -> dict:
+    f = c.get("fish", "?")
+
+    obs = {
+        "A": f"Ang Isda {f} ay paulit-ulit na nagpapalit ng direksyon at naiiba ang paglangoy kumpara sa ibang isda.",
+        "B": f"Nagbago ang paraan ng paglangoy ng Isda {f} kumpara sa dati nitong paglangoy.",
+        "C": f"Kapansin-pansing bumagal o huminto ang paggalaw ng Isda {f} kumpara sa dati nitong galaw."
+    }.get(c.get("why", "A"))
+
+    return {
+        "title": f"Hindi normal ang paglangoy ng Isda {f}",
+        "observation": obs,
+        "diagnosis": "Posibleng nakararanas ng stress, natatakot, o may sakit ang isda.",
+        "action": f"Obserbahan ang Isda {f} sa palaisdaan. {_CHECK_WATER} at tingnan kung may nakakagambala sa paligid."
+    }
+
+
+def _motionless(c: dict) -> dict:
+    f, s = c.get("fish", "?"), c.get("secs", 6)
+
+    return {
+        "title": f"Hindi gumagalaw ang Isda {f}",
+        "observation": f"Hindi gumalaw ang Isda {f} sa loob ng {s} segundo o higit pa.",
+        "diagnosis": (
+            "Posibleng may sakit, nanghihina, o patay na ang isda. "
+            "Posible ring nagpapahinga lamang ito o nagkamali ang sistema sa pagkilala "
+            "(halimbawa, bato o ibang bagay na napagkamalang isda)."
+        ),
+        "action": (
+            f"Suriin agad ang Isda {f} sa palaisdaan. "
+            "Kung talagang hindi ito gumagalaw, humingi ng tulong sa responsableng tauhan "
+            "at suriin ang kalidad ng tubig at oxygen."
+        )
+    }
+
+
+def _disturbance(c: dict) -> dict:
+    parts = [
+        f"{c[k]} ang {w}"
+        for k, w in (
+            ("turn", "pagliko"),
+            ("fast", "pagbilis"),
+            ("stop", "paghinto")
+        )
+        if c.get(k)
+    ]
+
+    extra = f" {', '.join(parts)}." if parts else ""
+
+    return {
+        "title": "Biglaang nagbago ang paglangoy ng mga isda",
+        "observation": (
+            f"Sa loob lamang ng ilang segundo, nagbago ang paglangoy "
+            f"ng {c.get('k', '?')} sa {c.get('n', '?')} na isda.{extra}"
+        ),
+        "diagnosis": (
+            "Posibleng nagulat o natakot ang mga isda dahil sa kaguluhan sa paligid, "
+            "tulad ng presensya ng tao, ingay, anino, o pagbabago sa tubig."
+        ),
+        "action": (
+            "Suriin kung may nagbago sa paligid ng palaisdaan. "
+            "Suriin din ang oxygen at temperatura ng tubig, at patuloy na obserbahan ang mga isda."
+        )
+    }
+
+
+def _school_turn(c: dict) -> dict:
+    return {
+        "title": "Biglang lumiko ang grupo ng mga isda",
+        "observation": (
+            f"Ang {c.get('k', '?')} na isda ay magkakasamang lumalangoy "
+            f"sa iisang direksyon ngunit bigla silang lumiko nang humigit-kumulang "
+            f"{c.get('deg', '?')} degrees."
+        ),
+        "diagnosis": (
+            "Posibleng may iniwasan o ikinatakot ang grupo, "
+            "tulad ng tao, anino, o sagabal."
+        ),
+        "action": (
+            "Suriin kung may tao o bagay na maaaring nakagulat sa grupo. "
+            "Obserbahan kung mauulit ang ganitong paggalaw."
+        )
+    }
+
+
+def _school_left(c: dict) -> dict:
+    f = c.get("fish", "?")
+
+    return {
+        "title": f"Nahiwalay sa grupo ang Isda {f}",
+        "observation": (
+            f"Dating lumalangoy kasama ng grupo ang Isda {f}, "
+            "ngunit ngayon ay nahiwalay na ito at lumalayo sa mga kasamahan nito."
+        ),
+        "diagnosis": "Posibleng nanghihina, may sakit, o natatakot ang isda.",
+        "action": (
+            f"Obserbahan ang Isda {f}. Kung patuloy itong naihihiwalay sa grupo, "
+            "ipasuri ito sa responsableng tauhan at suriin ang kalidad ng tubig."
+        )
+    }
+
+
+def _school_unusual(c: dict) -> dict:
+    return {
+        "title": "Maraming isda ang hindi normal ang paglangoy",
+        "observation": (
+            f"{c.get('u', '?')} sa {c.get('cl', '?')} na isda "
+            f"({c.get('pct', '?')}%) ang nagpapakita ng hindi normal na paglangoy "
+            "kumpara sa grupo o sa dati nilang paggalaw."
+        ),
+        "diagnosis": (
+            "Posibleng may problema sa kalidad ng tubig o sa kapaligiran, "
+            "tulad ng mababang oxygen o kaguluhan sa paligid."
+        ),
+        "action": (
+            "Suriin agad ang oxygen, temperatura, pH, at ammonia ng tubig. "
+            "Obserbahan din ang mga isda at ang kanilang kapaligiran."
+        )
+    }
+
+
+def _no_fish(c: dict) -> dict:
+    return {
+        "title": "Walang nakitang isda",
+        "observation": "Walang nakitang isda sa video.",
+        "diagnosis": (
+            "Posibleng malabo ang tubig, madilim ang video, "
+            "o hindi nakapuwesto nang maayos ang camera."
+        ),
+        "action": (
+            "Suriin ang camera at ang video. "
+            "Tiyaking malinaw na nakikita ang bahagi ng palaisdaan."
+        )
+    }
+
+
+_BUILDERS = {
+    "fish_unusual": _unusual,
+    "fish_motionless": _motionless,
+    "disturbance": _disturbance,
+    "school_turn": _school_turn,
+    "school_left": _school_left,
+    "school_unusual": _school_unusual,
+    "no_fish": _no_fish
 }
 
 
-@dataclass
-class Alert:
-    ts: float
-    level: str
-    kind: str
-    message: str
-    sms: str = "off"  # off | sending | sent | failed
+def build(kind: str, ctx: dict | None = None) -> dict:
+    """title / observation / diagnosis / action / level para sa isang alerto."""
+    d = _BUILDERS[kind](ctx or {})
+    d["level"] = LEVELS.get(kind, "warning")
+    return d
 
 
-class SmsSender:
-    def __init__(self, recipients_text: str = ""):
-        raw = recipients_text.strip() or os.getenv("SMS_RECIPIENTS", "")
-        self.recipients: List[str] = [r.strip() for r in raw.split(",") if r.strip()]
-        self.provider = os.getenv("SMS_PROVIDER", "none").strip().lower()
+def for_snapshot(snap):
+    """Teksto ng alerto para sa resulta ng buong grupo."""
+    kind = getattr(snap, "kind", "")
 
-    @property
-    def ready(self) -> bool:
-        return self.provider in ("twilio", "semaphore") and bool(self.recipients)
+    if kind == "no_fish":
+        return build("no_fish")
 
-    def send(self, text: str) -> bool:
-        import requests
+    if kind == "unusual":
+        u = int(getattr(snap, "unusual", 0))
+        cl = (
+            u
+            + int(getattr(snap, "normal", 0))
+            + int(getattr(snap, "schooling", 0))
+            + int(getattr(snap, "feeding", 0))
+        )
 
-        try:
-            if self.provider == "twilio":
-                sid, token = os.getenv("TWILIO_ACCOUNT_SID", ""), os.getenv("TWILIO_AUTH_TOKEN", "")
-                sender = os.getenv("TWILIO_FROM", "")
-                ok = True
-                for to in self.recipients:
-                    r = requests.post(
-                        f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-                        data={"To": to, "From": sender, "Body": text}, auth=(sid, token), timeout=10)
-                    ok = ok and r.status_code < 300
-                return ok
-            if self.provider == "semaphore":
-                payload = {"apikey": os.getenv("SEMAPHORE_API_KEY", ""),
-                           "number": ",".join(self.recipients), "message": text}
-                if os.getenv("SEMAPHORE_SENDER"):
-                    payload["sendername"] = os.getenv("SEMAPHORE_SENDER")
-                r = requests.post("https://api.semaphore.co/api/v4/messages", data=payload, timeout=10)
-                return r.status_code < 300
-        except Exception:
-            return False
-        return False
+        return build(
+            "school_unusual",
+            {
+                "u": u,
+                "cl": cl,
+                "pct": round(100 * u / cl) if cl else 0
+            }
+        )
+
+    return None
 
 
-class AlertManager:
-    def __init__(self, settings):
-        self.s = settings
-        self.recent: Deque[Alert] = deque(maxlen=20)
-        self._since: Dict[str, float] = {}
-        self._last_fired: Dict[str, float] = {}
+def recommendation(classified: int, unusual: int) -> dict:
+    """Teksto para sa Recommendation panel sa dashboard."""
 
-    def check(self, snap, now: Optional[float] = None) -> Optional[Alert]:
-        now = time.time() if now is None else now
-        kind = snap.kind
-        for k in list(self._since):          # condition cleared -> restart its timer
-            if k != kind:
-                del self._since[k]
-        if kind not in ABNORMAL:
-            return None
-        since = self._since.setdefault(kind, now)
-        if now - since < self.s.alert_confirm_s:
-            return None
-        if now - self._last_fired.get(kind, -1e12) < self.s.alert_cooldown_s:
-            return None
-        self._last_fired[kind] = now
+    if classified == 0:
+        return {
+            "tone": "mut",
+            "badge": "Naghihintay",
+            "headline": "Kinokolekta pa ang datos",
+            "note": (
+                "Kailangang obserbahan ang bawat isda sa loob ng ilang segundo "
+                "bago matukoy ang paraan ng paglangoy nito."
+            )
+        }
 
-        label = KIND_LABEL.get(kind, snap.status)
-        action = KIND_ACTION.get(kind, snap.action)
-        text = f"{label}: {snap.description}"
-        alert = Alert(now, snap.level, kind, text)
-        self.recent.appendleft(alert)
+    if unusual > 0:
+        return {
+            "tone": "warn",
+            "badge": LEVEL_TEXT["warning"],
+            "headline": f"{unusual} sa {classified} na isda ang hindi normal ang paglangoy",
+            "observation": (
+                "May nakitang hindi normal na direksyon o galaw sa ilan sa mga isda."
+            ),
+            "diagnosis": (
+                "Posibleng nakararanas ng stress, natatakot, o may sakit ang mga isda, "
+                "o kaya ay may problema sa kalidad ng tubig."
+            ),
+            "action": (
+                "Obserbahan ang mga isda at suriin ang oxygen, temperatura, "
+                "pH, at ammonia ng tubig."
+            )
+        }
 
-        wants_sms = (self.s.sms_enabled and kind != "no_fish"
-                     and LEVEL_RANK.get(snap.level, 0) >= LEVEL_RANK.get(self.s.sms_min_level, 1))
-        if wants_sms:
-            sender = SmsSender(self.s.sms_recipients)
-            if sender.ready:
-                alert.sms = "sending"
-                body = f"[Milkfish Monitor  {datetime.fromtimestamp(now):%H:%M}] {text} Action: {action}."
-                # the SMS thread writes the single log row once the final result is known
-                threading.Thread(target=self._send, args=(sender, body, alert), daemon=True).start()
-                return alert
-            alert.sms = "failed"  # enabled but provider/recipients not configured
-        self._log(alert)
-        return alert
-
-    def _send(self, sender: SmsSender, body: str, alert: Alert) -> None:
-        alert.sms = "sent" if sender.send(body) else "failed"
-        self._log(alert)
-
-    @staticmethod
-    def _log(alert: Alert) -> None:
-        """One database row per alert, saved with its final SMS status (off | sent | failed)."""
-        db.add_alert(datetime.fromtimestamp(alert.ts).strftime("%Y-%m-%d %H:%M:%S"),
-                     alert.level, alert.kind, alert.message, alert.sms)
+    return {
+        "tone": "ok",
+        "badge": LEVEL_TEXT["ok"],
+        "headline": "Ipagpatuloy ang regular na pagmamanman",
+        "note": "Walang nakitang hindi normal na paglangoy."
+    }
