@@ -1,14 +1,3 @@
-
-"""Mga tekstong Tagalog para sa mga alerto, nakuhang larawan, at panel ng rekomendasyon.
-
-Bawat alerto ay may pamagat at tatlong bahagi:
-"Nakita" (obserbasyon), "Posibleng Sanhi" (posibleng dahilan),
-at "Dapat Gawin" (inirerekomendang aksyon).
-
-Ang posibleng sanhi ay pagtataya lamang batay sa galaw ng isda sa video.
-Hindi ito kumpirmadong diagnosis.
-"""
-
 from __future__ import annotations
 
 OBS, DIAG, ACT = "Nakita", "Posibleng Sanhi", "Dapat Gawin"
