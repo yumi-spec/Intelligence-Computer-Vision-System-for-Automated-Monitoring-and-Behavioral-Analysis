@@ -2,6 +2,9 @@
 [server]
 maxUploadSize = 2048        # largest video you can upload, in MB (Streamlit's default is only 200)
 
+[client]
+toolbarMode = "viewer"      # hides the developer menu and GitHub repo shortcut for end users
+
 [theme]
 base = "light"
 primaryColor = "#14532D"
